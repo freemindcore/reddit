@@ -31,7 +31,7 @@ from r2.models import Account, Report
 from r2.models.subreddit import SubSR
 from r2.models.token import OAuth2Scope, extra_oauth2_scope
 import time, pytz
-from pylons import c, g
+from pylons import c, g, response
 from pylons.i18n import _
 
 from r2.models.wiki import ImagesByWikiPage
@@ -230,18 +230,26 @@ class SubredditJsonTemplate(ThingJsonTemplate):
     )
 
     # subreddit *attributes* (right side of the equals)
-    # that are only accessible if the user can view the subreddit
-    _private_attrs = set([
-        "accounts_active",
-        "comment_score_hide_mins",
-        "description",
-        "description_html",
-        "header",
-        "header_size",
-        "header_title",
-        "submit_link_label",
-        "submit_text_label",
-    ])
+    # that are accessible even if the user can't view the subreddit
+    _public_attrs = {
+        "_id36",
+        # subreddit ID with prefix
+        "_fullname",
+        # Creation date
+        "created",
+        "created_utc",
+        # Canonically-cased subreddit name
+        "name",
+        # Canonical subreddit URL, relative to reddit.com
+        "path",
+        # Text shown on the access denied page
+        "public_description",
+        "public_description_html",
+        # Title shown in search
+        "title",
+        # Type of subreddit, so people know that it's private
+        "type",
+    }
 
     def raw_data(self, thing):
         data = ThingJsonTemplate.raw_data(self, thing)
@@ -252,7 +260,7 @@ class SubredditJsonTemplate(ThingJsonTemplate):
         return data
 
     def thing_attr(self, thing, attr):
-        if attr in self._private_attrs and not thing.can_view(c.user):
+        if attr not in self._public_attrs and not thing.can_view(c.user):
             return None
 
         if attr == "_ups" and thing.hide_subscribers:
@@ -326,6 +334,7 @@ class IdentityJsonTemplate(ThingJsonTemplate):
         is_mod="is_mod",
         link_karma="link_karma",
         name="name",
+        hide_from_robots="pref_hide_from_robots",
     )
     _private_data_attrs = dict(
         over_18="pref_over_18",
@@ -337,6 +346,8 @@ class IdentityJsonTemplate(ThingJsonTemplate):
         attrs = self._data_attrs_.copy()
         if c.user_is_loggedin and thing._id == c.user._id:
             attrs.update(self._private_data_attrs)
+        if thing.pref_hide_from_robots:
+            response.headers['X-Robots-Tag'] = 'noindex, nofollow'
         data = {k: self.thing_attr(thing, v) for k, v in attrs.iteritems()}
         try:
             self.add_message_data(data, thing)
@@ -906,7 +917,7 @@ class FlairListJsonTemplate(JsonTemplate):
                           flair_css_class=row.flair_css_class)
             else:
               # prev/next link
-              return dict(after=row.after, reverse=row.reverse)
+              return dict(after=row.after, reverse=row.previous)
 
         json_rows = [row_to_json(row) for row in thing.flair]
         result = dict(users=[row for row in json_rows if 'user' in row])
@@ -1043,6 +1054,15 @@ class SubredditSettingsTemplate(ThingJsonTemplate):
         if attr.startswith('site.') and thing.site:
             return getattr(thing.site, attr[5:])
         return ThingJsonTemplate.thing_attr(self, thing, attr)
+
+
+class UploadedImageJsonTemplate(JsonTemplate):
+    def render(self, thing, *a, **kw):
+        return ObjectTemplate({
+            "errors": list(k for (k, v) in thing.errors if v),
+            "img_src": thing.img_src,
+        })
+
 
 class ModActionTemplate(ThingJsonTemplate):
     _data_attrs_ = dict(

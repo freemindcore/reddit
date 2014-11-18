@@ -51,7 +51,7 @@ from r2.lib.utils import (
     trunc_string,
     precise_format_timedelta,
 )
-from r2.lib import organic, sup, trending
+from r2.lib import hooks, organic, sup, trending
 from r2.lib.memoize import memoize
 from r2.lib.validator import *
 import socket
@@ -93,6 +93,7 @@ class ListingController(RedditController):
     # login box, subreddit box, submit box, etc, visible
     show_sidebar = True
     show_chooser = False
+    suppress_reply_buttons = False
 
     # class (probably a subclass of Reddit) to use to render the page.
     render_cls = Reddit
@@ -209,6 +210,7 @@ class ListingController(RedditController):
         for i in pane:
             if hasattr(i, 'full_comment_path'):
                 i.child = None
+            i.suppress_reply_buttons = self.suppress_reply_buttons
         return pane
 
     def title(self):
@@ -274,6 +276,17 @@ class SubredditListingController(ListingController):
         else:
             if not c.user_is_loggedin:
                 # This data is only for scrapers, which shouldn't be logged in.
+                twitter_card = {
+                    "site": "reddit",
+                    "card": "summary",
+                    "title": self._build_og_title(max_length=70),
+                    # Twitter will fall back to any defined OpenGraph
+                    # attributes, so we don't need to define
+                    # 'twitter:image' or 'twitter:description'.
+                }
+                hook = hooks.get_hook('subreddit_listing.twitter_card')
+                hook.call(tags=twitter_card, sr_name=c.site.name)
+
                 return {
                     "og_data": {
                         "site_name": "reddit",
@@ -281,14 +294,7 @@ class SubredditListingController(ListingController):
                         "image": static('icon.png'),
                         "description": self._build_og_description(),
                     },
-                    "twitter_card": {
-                        "site": "reddit",
-                        "card": "summary",
-                        "title": self._build_og_title(max_length=70),
-                        # Twitter will fall back to any defined OpenGraph
-                        # attributes, so we don't need to define
-                        # 'twitter:image' or 'twitter:description'.
-                    },
+                    "twitter_card": twitter_card,
                 }
 
             return {}
@@ -799,7 +805,7 @@ class UserController(ListingController):
         return q
 
     @require_oauth2_scope("history")
-    @validate(vuser = VExistingUname('username'),
+    @validate(vuser = VExistingUname('username', allow_deleted=True),
               sort = VMenu('sort', ProfileSortMenu, remember = False),
               time = VMenu('t', TimeMenu, remember = False),
               show=VOneOf('show', ('given',)))
@@ -816,6 +822,10 @@ class UserController(ListingController):
 
         # the validator will ensure that vuser is a valid account
         if not vuser:
+            return self.abort404()
+
+        # only allow admins to view deleted users
+        if vuser._deleted and not c.user_is_admin:
             return self.abort404()
 
         if c.user_is_admin:
@@ -863,6 +873,7 @@ class UserController(ListingController):
         self.vuser = vuser
         self.render_params = {'user' : vuser}
         c.profilepage = True
+        self.suppress_reply_buttons = True
 
         if vuser.pref_hide_from_robots:
             self.robots = 'noindex,nofollow'
@@ -1155,6 +1166,7 @@ class MessageController(ListingController):
         mod_srs = []
         subreddit_message = False
         from_user = True
+        self.where = "compose"
 
         if isinstance(c.site, MultiReddit):
             mod_srs = c.site.srs_with_perms(c.user, "mail")
@@ -1181,7 +1193,7 @@ class MessageController(ListingController):
             content = MessageCompose(to=to, subject=subject, captcha=captcha,
                                      message=message)
 
-        return MessagePage(content=content).render()
+        return MessagePage(content=content, title=self.title()).render()
 
 class RedditsController(ListingController):
     render_cls = SubredditsPage
@@ -1347,6 +1359,7 @@ class CommentsController(SubredditListingController):
     @require_oauth2_scope("read")
     def GET_listing(self, **env):
         c.profilepage = True
+        self.suppress_reply_buttons = True
         return ListingController.GET_listing(self, **env)
 
 
@@ -1627,4 +1640,5 @@ class GildedController(SubredditListingController):
     @require_oauth2_scope("read")
     def GET_listing(self, **env):
         c.profilepage = True
+        self.suppress_reply_buttons = True
         return ListingController.GET_listing(self, **env)

@@ -297,7 +297,7 @@ def _validatedForm(self, self_method, responder, simple_vals, param_vals,
     form = responder(request.POST.get('id', "body"))
 
     # clear out the status line as a courtesy
-    form.set_html(".status", "")
+    form.set_text(".status", "")
 
     # do the actual work
     val = self_method(self, form, responder, *a, **kw)
@@ -1463,7 +1463,8 @@ class VShamedDomain(Validator):
                                                       reason=reason))
 
 class VExistingUname(VRequired):
-    def __init__(self, item, *a, **kw):
+    def __init__(self, item, allow_deleted=False, *a, **kw):
+        self.allow_deleted = allow_deleted
         VRequired.__init__(self, item, errors.NO_USER, *a, **kw)
 
     def run(self, name):
@@ -1481,6 +1482,12 @@ class VExistingUname(VRequired):
             try:
                 return Account._by_name(name)
             except NotFound:
+                if self.allow_deleted and c.user_is_admin:
+                    try:
+                        return Account._by_name(name, allow_deleted=True)
+                    except NotFound:
+                        pass
+
                 self.error(errors.USER_DOESNT_EXIST)
         else:
             self.error()
@@ -1784,8 +1791,11 @@ class VDelay(Validator):
 class VCommentIDs(Validator):
     def run(self, id_str):
         if id_str:
-            cids = [int(i, 36) for i in id_str.split(',')]
-            return cids
+            try:
+                cids = [int(i, 36) for i in id_str.split(',')]
+                return cids
+            except ValueError:
+                abort(400)
         return []
 
     def param_docs(self):

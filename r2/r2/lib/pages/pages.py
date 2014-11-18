@@ -24,6 +24,7 @@
 from collections import Counter, OrderedDict
 
 from r2.config import feature
+from r2.lib.db.operators import asc
 from r2.lib.wrapped import Wrapped, Templated, CachedTemplate
 from r2.models import (
     Account,
@@ -36,6 +37,7 @@ from r2.models import (
     FakeSubreddit,
     Filtered,
     Flair,
+    FlairListBuilder,
     FlairTemplate,
     FlairTemplateBySubredditIndex,
     Friends,
@@ -94,7 +96,7 @@ from pylons.i18n import _, ungettext
 from pylons import c, request, g, config
 from pylons.controllers.util import abort
 
-from r2.lib import media, inventory
+from r2.lib import hooks, inventory, media
 from r2.lib import promote, tracking
 from r2.lib.captcha import get_iden
 from r2.lib.filters import (
@@ -113,7 +115,7 @@ from r2.lib.menus import SubredditButton, SubredditMenu, ModeratorMailButton
 from r2.lib.menus import OffsiteButton, menu, JsNavMenu
 from r2.lib.normalized_hot import normalized_hot
 from r2.lib.strings import plurals, rand_strings, strings, Score
-from r2.lib.utils import title_to_url, query_string, UrlParser
+from r2.lib.utils import is_subdomain, title_to_url, query_string, UrlParser
 from r2.lib.utils import url_links_builder, make_offset_date, median, to36
 from r2.lib.utils import trunc_time, timesince, timeuntil, weighted_lottery
 from r2.lib.template_helpers import (
@@ -282,7 +284,7 @@ class Reddit(Templated):
                 self.infobar = InfoBar(
                     message=infotext, extra_class=infotext_class)
             elif (isinstance(c.site, DomainSR) and
-                    c.site.domain.endswith("imgur.com")):
+                    is_subdomain(c.site.domain, "imgur.com")):
                 self.infobar = InfoBar(message=
                     _("imgur.com domain listings (including this one) are "
                       "currently disabled to speed up vote processing.")
@@ -1422,11 +1424,13 @@ class LinkInfoPage(Reddit):
             short_description,
         )
 
-        if feature.is_enabled('link_twitter_card_data'):
-            self.twitter_card = self._build_twitter_card_data(
-                _force_unicode(link_title),
-                short_description,
-            )
+        self.twitter_card = self._build_twitter_card_data(
+            _force_unicode(link_title),
+            short_description,
+        )
+        hook = hooks.get_hook('comments_page.twitter_card')
+        hook.call(tags=self.twitter_card, sr_name=c.site.name,
+                  id36=self.link._id36)
 
         if hasattr(self.link, "dart_keyword"):
             c.custom_dart_keyword = self.link.dart_keyword
@@ -2457,6 +2461,9 @@ class UploadedImage(Templated):
         Templated.__init__(self, status=status, img_src=img_src, name = name,
                            form_id = form_id)
 
+    def render(self, *a, **kw):
+        return responsive(Templated.render(self, *a, **kw))
+
 class Thanks(Templated):
     """The page to claim reddit gold trophies"""
     def __init__(self, secret=None):
@@ -3386,50 +3393,66 @@ class FlairList(Templated):
             # user lookup was requested, but no user was found, so abort
             return []
 
-        # Fetch one item more than the limit, so we can tell if we need to link
-        # to a "next" page.
-        query = Flair.flair_id_query(c.site, self.num + 1, self.after,
-                                     self.reverse)
-        flair_rows = list(query)
-        if len(flair_rows) > self.num:
-            next_page = flair_rows.pop()
-        else:
-            next_page = None
-        uids = [row._thing2_id for row in flair_rows]
-        users = Account._byID(uids, data=True)
-        users = {id: u for id, u in users.iteritems() if not u._deleted}
-        result = [FlairListRow(users[row._thing2_id])
-                  for row in flair_rows if row._thing2_id in users]
+        query = Flair._query(Flair.c._thing1_id == c.site._id,
+                             Flair.c._name == 'flair',
+                             sort=asc('_thing2_id'))
+
+        # To maintain API compatibility we can't use the `before` or `after`s
+        # returned by Builder.get_items(), since we use different logic to
+        # determine them. We also need to fetch an extra item to be *sure*
+        # there's a next page.
+        builder = FlairListBuilder(query, wrap=FlairListRow.from_rel,
+                                   after=self.after, reverse=self.reverse,
+                                   num=self.num + 1)
+
+        items = builder.get_items()[0]
+
+        if not items:
+            return []
+
+        have_more = False
+        if self.num and len(items) > self.num:
+            if self.reverse:
+                have_more = items.pop(0)
+            else:
+                have_more = items.pop()
+
+        # FlairLists are unusual in that afters that aren't in the queryset
+        # work correctly due to the filter just doing a gt (or lt) on
+        # the after's `_id`. They also use _thing2's fullname instead
+        # of the fullname of the rel for pagination.
+        before = items[0].user._fullname
+        after = items[-1].user._fullname
+
         links = []
-        if self.after:
-            links.append(
-                FlairNextLink(result[0].user._fullname,
-                              reverse=not self.reverse,
-                              needs_border=bool(next_page)))
-        if next_page:
-            links.append(
-                FlairNextLink(result[-1].user._fullname, reverse=self.reverse))
-        if self.reverse:
-            result.reverse()
-            links.reverse()
-            if len(links) == 2 and links[1].needs_border:
-                # if page was rendered after clicking "prev", we need to move
-                # the border to the other link.
-                links[0].needs_border = True
-                links[1].needs_border = False
-        return result + links
+        show_next = have_more or self.reverse
+        if (not self.reverse and self.after) or (self.reverse and have_more):
+            links.append(FlairNextLink(before, previous=True,
+                                       needs_border=show_next))
+        if show_next:
+            links.append(FlairNextLink(after, previous=False))
+
+        return items + links
+
 
 class FlairListRow(Templated):
     def __init__(self, user):
-        get_flair_attr = lambda a: getattr(user,
-                                           'flair_%s_%s' % (c.site._id, a), '')
-        Templated.__init__(self, user=user,
-                           flair_text=get_flair_attr('text'),
-                           flair_css_class=get_flair_attr('css_class'))
+        self.user = user
+        Templated.__init__(self,
+                           flair_text=user.flair_text(c.site._id),
+                           flair_css_class=user.flair_css_class(c.site._id))
+
+    @classmethod
+    def from_rel(cls, rel):
+        instance = cls(rel._thing2)
+        # Needed by the builder to do wrapped -> unwrapped lookups
+        instance._id = rel._id
+        return instance
+
 
 class FlairNextLink(Templated):
-    def __init__(self, after, reverse=False, needs_border=False):
-        Templated.__init__(self, after=after, reverse=reverse,
+    def __init__(self, after, previous=False, needs_border=False):
+        Templated.__init__(self, after=after, previous=previous,
                            needs_border=needs_border)
 
 class FlairCsv(Templated):
@@ -3611,14 +3634,16 @@ class DetailsPage(LinkInfoPage):
         after = kwargs.pop('after', None)
         reverse = kwargs.pop('reverse', False)
         count = kwargs.pop('count', None)
+        self.details = None
 
         if isinstance(thing, (Link, Comment)):
-            details = Details(thing, after=after, reverse=reverse, count=count)
+            self.details = Details(thing, after=after, reverse=reverse,
+                                   count=count)
 
         if isinstance(thing, Link):
             link = thing
             comment = None
-            content = details
+            content = self.details
         elif isinstance(thing, Comment):
             comment = thing
             link = Link._byID(comment.link_id, data=True)
@@ -3627,7 +3652,7 @@ class DetailsPage(LinkInfoPage):
             content.append(LinkCommentSep())
             content.append(CommentPane(link, CommentSortMenu.operator('new'),
                                    comment, None, 1))
-            content.append(details)
+            content.append(self.details)
 
         kwargs['content'] = content
         LinkInfoPage.__init__(self, link, comment, *args, **kwargs)

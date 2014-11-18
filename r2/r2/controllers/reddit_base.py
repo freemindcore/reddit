@@ -66,6 +66,7 @@ from r2.lib.utils import (
     Enum,
     SimpleSillyStub,
     UniqueIterator,
+    extract_subdomain,
     http_utils,
     is_subdomain,
     is_throttled,
@@ -217,6 +218,8 @@ class UnloggedUser(FakeAccount):
         self._defaults['pref_frame_commentspanel'] = False
         self._defaults['pref_hide_locationbar'] = False
         self._defaults['pref_use_global_defaults'] = False
+        if feature.is_enabled('new_user_new_window_preference'):
+            self._defaults['pref_newwindow'] = True
         self._load()
 
     @property
@@ -753,16 +756,23 @@ def enforce_https():
     if c.forced_loggedout or c.render_style == "js":
         return
 
+    redirect_url = None
+
     # This is likely a request from an API client. Redirecting them or giving
     # them an HSTS grant is unlikely to stop them from making requests to HTTP.
-    # Just record it so we know who to talk to.
-    if is_api() and c.user.https_forced and not c.secure:
-        g.stats.count_string('https.pref_violation', request.user_agent)
-        # TODO: 400 here after a grace period. Sending a user's cookies over
-        # HTTP when they asked you not to isn't nice.
+    if is_api() and not c.secure:
+        # Record the violation so we know who to talk to.
+        if c.user.https_forced:
+            g.stats.count_string('https.pref_violation', request.user_agent)
+            # TODO: 400 here after a grace period. Sending a user's cookies over
+            # HTTP when they asked you not to isn't nice.
+
+        # They didn't send a login cookie, but their cookies indicate they won't
+        # be authed properly unless we redirect them to the secure version.
+        if have_secure_session_cookie() and not c.user_is_loggedin:
+            redirect_url = make_url_https(request.environ['FULLPATH'])
 
     need_grant = False
-    redirect_url = None
     grant = None
     # Forcing the users through the HSTS gateway probably wouldn't help much for
     # other render types since they're mostly made by clients that don't respect
@@ -1066,6 +1076,7 @@ class MinimalController(BaseController):
         c.extension = request.environ.get('extension')
         # the domain has to be set before Cookies get initialized
         set_subreddit()
+        c.subdomain = extract_subdomain()
         c.errors = ErrorSet()
         c.cookies = Cookies()
         # if an rss feed, this will also log the user in if a feed=
